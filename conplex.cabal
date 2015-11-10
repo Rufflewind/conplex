@@ -20,6 +20,7 @@ source-repository head
 executable conplex
   main-is:             Main.hs
   other-modules:       Common
+                       Conplex
   other-extensions:    CPP
                        FlexibleInstances
                        OverloadedStrings
