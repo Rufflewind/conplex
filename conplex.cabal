@@ -1,0 +1,40 @@
+name:                conplex
+version:             1.0.0
+synopsis:            Inverse multiplexer for TCP connections.
+description:         Inverse multiplexer for TCP connections.
+homepage:            https://github.com/Rufflewind/conplex
+bug-reports:         https://github.com/Rufflewind/conplex/issues
+license:             MIT
+license-file:        LICENSE
+author:              Phil Ruffwind
+maintainer:          rf@rufflewind.com
+copyright:           (c) 2015 Phil Ruffwind
+category:            Network
+build-type:          Simple
+cabal-version:       >=1.10
+
+source-repository head
+  type:                git
+  location:            https://github.com/Rufflewind/conplex
+
+executable conplex
+  main-is:             Main.hs
+  other-modules:       Common
+  other-extensions:    CPP
+                       FlexibleInstances
+                       OverloadedStrings
+                       TypeSynonymInstances
+  build-depends:       base >=4.8 && <4.9
+                     , async
+                     , bytestring
+                     , cereal
+                     , containers
+                     , entropy
+                     , int-cast
+                     , mtl
+                     , network-simple
+                     , random-shuffle
+                     , transformers
+  default-language:    Haskell2010
+                       -- temporary flags
+  ghc-options:         -Wall -fno-warn-name-shadowing -fno-warn-unused-imports
