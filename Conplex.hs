@@ -23,6 +23,7 @@ import Data.Maybe (fromMaybe)
 import Data.Monoid ((<>))
 import Data.Sequence (Seq, ViewL((:<)), (|>))
 import Data.Serialize
+import Data.Traversable (for)
 import Data.Tuple (swap)
 import Data.Typeable (Typeable, typeRep)
 import Data.Word (Word64, Word32)
@@ -155,6 +156,10 @@ type Pos = Word64
 
 type MergerState = (Map Pos (MVar ByteString), Maybe Pos)
 
+
+mergerInitState :: MergerState
+mergerInitState = (Map.empty, Nothing)
+
 mergerSetPos :: MVar MergerState -> Pos -> IO ()
 mergerSetPos state pos = do
   modifyMVar_ state $ \ (table, _) ->
@@ -200,15 +205,18 @@ mergerReceiver socket state vPull vPush = do
   mergerPush state vPull vPush (pos, msg)
   mergerReceiver socket state vPull vPush
 
-mergerSender :: Socket
-             -> MVar MergerState
-             -> MVar ByteString
-             -> Pos
-             -> IO a
-mergerSender socket state vPull pos = do
+mergerSender :: Socket -> MVar MergerState -> MVar ByteString -> IO a
+mergerSender = mergerSenderResume 0
+
+mergerSenderResume :: Pos
+                   -> Socket
+                   -> MVar MergerState
+                   -> MVar ByteString
+                   -> IO a
+mergerSenderResume pos socket state vPull = do
   msg <- mergerPull state vPull pos
   send socket msg
-  mergerSender socket state vPull (pos + fromIntegral (B.length msg))
+  mergerSenderResume (pos + fromIntegral (B.length msg)) socket state vPull
 
 type HostService = (HostName, ServiceName)
 
@@ -228,42 +236,54 @@ serveTransporter _ [] = error "serveTransporter: no destination given"
 serveTransporter (bindHost, bindPort) destServs =
   serve bindHost bindPort $ \ (bindSocket, _) -> do
     destServ0 : destServRest <- shuffleM destServs
+    vPush0 <- newEmptyMVar
+    svPushRest <- for destServRest $ \ x -> (,) x <$> newEmptyMVar
     vConnID  <- newEmptyMVar
     vMessage <- newEmptyMVar
-    splitterReceiver vMessage bindSocket 0
-      `concurrently_`
-      connectProxied destServ0 (initConn vMessage vConnID)
-      `concurrently_`
-       mapConcurrently_ (`connectProxied` joinConn vMessage vConnID)
-                        destServRest
+    vPull <- newEmptyMVar
+    vState <- newMVar mergerInitState
+    downstream vState vPull vMessage bindSocket `concurrently_`
+      connectProxied destServ0
+        (initConn vState vPull vPush0 vMessage vConnID) `concurrently_`
+      ((`mapConcurrently_` svPushRest) $ \ (serv, vPush) ->
+        connectProxied serv (joinConn vState vPull vPush vMessage vConnID))
   where
 
-    initConn vMessage vConnID (socket, _) = do
+    initConn vState vPull vPush vMessage vConnID (socket, _) = do
       sendMany socket [encode protocolVer, encode Initiate]
       Welcome <- recvThenDecodeX socket
       connID  <- recvThenDecodeX socket
       putMVar vConnID (connID :: ConnectionID)
-      splitterSender vMessage socket
+      upstream vState vPull vPush vMessage socket
 
-    joinConn vMessage vConnID (socket, _) = do
+    joinConn vState vPull vPush vMessage vConnID (socket, _) = do
       connID <- readMVar vConnID
       sendMany socket [encode protocolVer, encode Join, encode connID]
       reply <- recvThenDecodeX socket
       case reply of
-         Accept  -> splitterSender vMessage socket
+         Accept  -> upstream vState vPull vPush vMessage socket
          Invalid -> pure () -- teardown connection
 
-type SplitterState = MVar (Pos, ByteString)
+    downstream vState vPull vMessage socket =
+      splitterReceiver vMessage socket `concurrently_`
+      mergerSender socket vState vPull
 
-splitterSender :: SplitterState -> Socket -> IO ()
+    upstream vState vPull vPush vMessage socket =
+      splitterSender vMessage socket `concurrently_`
+      mergerReceiver socket vState vPull vPush
+
+splitterSender :: MVar (Pos, ByteString) -> Socket -> IO ()
 splitterSender vMessage socket = do
   takeMVar vMessage >>= sendChunk socket
   splitterSender vMessage socket
 
-splitterReceiver :: SplitterState -> Socket -> Pos -> IO ()
-splitterReceiver vMessage socket pos = do
+splitterReceiver :: MVar (Pos, ByteString) -> Socket -> IO ()
+splitterReceiver = splitterReceiverResume 0
+
+splitterReceiverResume :: Pos -> MVar (Pos, ByteString) -> Socket -> IO ()
+splitterReceiverResume pos vMessage socket = do
   recvX socket maxChunkSize >>= putMVar vMessage . ((,) pos)
-  splitterReceiver vMessage socket (pos + 1)
+  splitterReceiverResume (pos + 1) vMessage socket
 
 -- | Same as 'Int' except negative values are not allowed.
 --   It is serialized in the same way as 'Word64'.
