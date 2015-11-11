@@ -26,8 +26,6 @@ import Data.Word (Word64, Word32)
 import Foreign (Storable, sizeOf)
 import Network.Simple.TCP
 import System.IO
-import System.Entropy (getEntropy)
-import System.Random.Shuffle (shuffleM)
 import qualified Data.ByteString.Char8 as B
 import qualified Data.ByteString.Lazy.Char8 as BL
 import qualified Data.Map.Strict as Map

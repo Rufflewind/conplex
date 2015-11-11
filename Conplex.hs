@@ -31,7 +31,6 @@ import Foreign (Storable, sizeOf)
 import Network.Simple.TCP
 import System.IO
 import System.Entropy (getEntropy)
-import System.Random.Shuffle (shuffleM)
 import qualified Data.ByteString.Char8 as B
 import qualified Data.ByteString.Lazy.Char8 as BL
 import qualified Data.Map.Strict as Map
@@ -156,7 +155,6 @@ type Pos = Word64
 
 type MergerState = (Map Pos (MVar ByteString), Maybe Pos)
 
-
 mergerInitState :: MergerState
 mergerInitState = (Map.empty, Nothing)
 
@@ -235,46 +233,47 @@ serveTransporter :: (HostPreference, ServiceName)
 serveTransporter _ [] = error "serveTransporter: no destination given"
 serveTransporter (bindHost, bindPort) destServs =
   serve bindHost bindPort $ \ (bindSocket, _) -> do
-    destServ0 : destServRest <- shuffleM destServs
-    vPush0 <- newEmptyMVar
-    svPushRest <- for destServRest $ \ x -> (,) x <$> newEmptyMVar
-    vConnID  <- newEmptyMVar
+    vConnID <- newMVar Nothing
     vMessage <- newEmptyMVar
-    vPull <- newEmptyMVar
-    vState <- newMVar mergerInitState
-    downstream vState vPull vMessage bindSocket `concurrently_`
-      connectProxied destServ0
-        (initConn vState vPull vPush0 vMessage vConnID) `concurrently_`
-      ((`mapConcurrently_` svPushRest) $ \ (serv, vPush) ->
-        connectProxied serv (joinConn vState vPull vPush vMessage vConnID))
+    vPState <- (,) <$> newEmptyMVar <*> newMVar mergerInitState
+    svPushs <- for destServs $ \ x -> (,) x <$> newEmptyMVar
+    concurrently_
+      (downstream vPState vMessage bindSocket)
+      (mapConcurrently_ (upstreamThread vConnID vMessage vPState) svPushs)
   where
 
-    initConn vState vPull vPush vMessage vConnID (socket, _) = do
-      sendMany socket [encode protocolVer, encode Initiate]
-      Welcome <- recvThenDecodeX socket
-      connID  <- recvThenDecodeX socket
-      putMVar vConnID (connID :: ConnectionID)
-      upstream vState vPull vPush vMessage socket
+    upstreamThread vConnID vMessage vPState (serv, vPush) =
+      connectProxied serv $ \ (socket, _) -> do
+        send socket (encode protocolVer)
+        reply <- modifyMVar vConnID $ \ mConnID ->
+          case mConnID of
+            Nothing -> do
+              send socket (encode Initiate)
+              Welcome <- recvThenDecodeX socket
+              connID <- recvThenDecodeX socket
+              pure (Just connID, Accept)
+            Just connID -> do
+              sendMany socket [encode Join, encode connID]
+              reply <- recvThenDecodeX socket
+              pure (mConnID, reply)
+        case reply of
+          Accept  -> upstream vPState vPush vMessage socket
+          Invalid -> pure () -- tear down connection
 
-    joinConn vState vPull vPush vMessage vConnID (socket, _) = do
-      connID <- readMVar vConnID
-      sendMany socket [encode protocolVer, encode Join, encode connID]
-      reply <- recvThenDecodeX socket
-      case reply of
-         Accept  -> upstream vState vPull vPush vMessage socket
-         Invalid -> pure () -- teardown connection
-
-    downstream vState vPull vMessage socket =
+    downstream (vPull, vState) vMessage socket =
       splitterReceiver vMessage socket `concurrently_`
       mergerSender socket vState vPull
 
-    upstream vState vPull vPush vMessage socket =
+    upstream (vPull, vState) vPush vMessage socket =
       splitterSender vMessage socket `concurrently_`
       mergerReceiver socket vState vPull vPush
 
 splitterSender :: MVar (Pos, ByteString) -> Socket -> IO ()
 splitterSender vMessage socket = do
-  takeMVar vMessage >>= sendChunk socket
+  bracketOnError
+    (takeMVar vMessage)
+    (putMVar vMessage)
+    (sendChunk socket)
   splitterSender vMessage socket
 
 splitterReceiver :: MVar (Pos, ByteString) -> Socket -> IO ()
