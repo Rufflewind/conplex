@@ -39,16 +39,13 @@ main = withSocketsDo $ do
   forkIO_ (serveTransporter (bindHost, bindPort)
                             ((,) proxy . (,) destHost <$> destPorts))
   -- forkIO (portForward (Host "127.0.0.1", show 9001) ("127.0.0.1", "9002"))
-  -- for_ bindPorts (forkIO . serverThread connections bindHost)
-  -- for_ destPorts (forkIO . clientThread state destHost)
+  for_ ((,) (Host destHost) <$> destPorts) $ \ (bindHost, bindPort) ->
+    (serveReceptor (bindHost, bindPort) (Nothing, ("127.0.0.1", "8080")))
 
   standby
   where
     bindHost = Host "127.0.0.1"
-    bindPort = portNumber 8000
+    bindPort = 8000 :: Int
     destHost = "127.0.0.1"
-    destPorts = portNumber <$> [12000 .. 12001]
+    destPorts = [12000 .. 12001 :: Int]
     proxy = Nothing -- Just ("127.0.0.0", 7999)
-
-portNumber :: Int -> ServiceName
-portNumber = show

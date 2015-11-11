@@ -28,7 +28,9 @@ import Data.Tuple (swap)
 import Data.Typeable (Typeable, typeRep)
 import Data.Word (Word64, Word32)
 import Foreign (Storable, sizeOf)
+import Network (PortID(PortNumber))
 import Network.Simple.TCP
+import Network.Socks5 (defaultSocksConf, socksConnectWith)
 import System.IO
 import System.Entropy (getEntropy)
 import qualified Data.ByteString.Char8 as B
@@ -216,16 +218,95 @@ mergerSenderResume pos socket state vPull = do
   send socket msg
   mergerSenderResume (pos + fromIntegral (B.length msg)) socket state vPull
 
-type HostService = (HostName, ServiceName)
+type SplitterState = MVar (Maybe (Pos, ByteString))
+
+splitterStateNew :: IO SplitterState
+splitterStateNew = newEmptyMVar
+
+splitterSender :: SplitterState -> Socket -> IO ()
+splitterSender vMessage socket =
+  join $ mask $ \ unmask -> do
+    mMsg <- takeMVar vMessage
+    case mMsg of
+      Just msg -> do
+        unmask (sendChunk socket msg)
+          `onException` putMVar vMessage mMsg
+        pure (splitterSender vMessage socket)
+      Nothing  -> do
+        putMVar vMessage mMsg
+        pure (pure ())
+
+splitterReceiver :: SplitterState -> Socket -> IO ()
+splitterReceiver = splitterReceiverResume 0
+
+splitterReceiverResume :: Pos -> SplitterState -> Socket -> IO ()
+splitterReceiverResume pos vMessage socket = do
+  mMsg <- recv socket maxChunkSize
+  case mMsg of
+    Nothing  -> putMVar vMessage Nothing
+    Just msg -> do
+      putMVar vMessage (Just (pos, msg))
+      splitterReceiverResume (pos + 1) vMessage socket
+
+type HostService = (HostName, Int)
 
 type ProxiedHostService = (Maybe HostService, HostService)
+
+-- type ConnTable = Map ConnectionID (Int {-refcount-})
 
 serveReceptor :: (HostPreference, ServiceName)
               -> HostService
               -> IO ()
-serveReceptor (bindHost, bindPort) destServ =
-  serve bindHost bindPort $ \ (bindSocket, _) -> do
-    _
+serveReceptor (bindHost, bindPort) destServ = do
+  vConnTable <- newMVar (Map.empty)
+  serve bindHost bindPort $ \ (socket, _) -> do
+    header <- recvThenDecodeX socket
+    case header of
+      HeaderV1 -> pure ()
+    command <- recvThenDecodeX socket
+    case command of
+      Initiate -> do
+        vPState <- (,) <$> newEmptyMVar <*> newMVar mergerInitState
+        splitterState <- splitterStateNew
+        let connInfo = (1, (vPState, splitterState))
+        connTable <- takeMVar vConnTable
+        connID <- generateConnectionID connTable
+                  `onException` putMVar vConnTable connTable
+        let connTable' = Map.insert connID connInfo connTable
+        forkIO_ (upstreamThread vPState splitterState vConnTable connID)
+        putMVar connTable'
+        send socket (encode connID)
+        vPush <- newEmptyMVar
+        downstreamThread splitterState vPState vPush socket
+      Join -> do
+        connID <- recvThenDecodeX socket
+        connTable <- takeMVar vConnTable
+        case Map.lookup connID connTable of
+          Nothing ->
+            putMVar vConnTable connTable
+            send socket (encode Invalid)
+          Just (_, (vPState, splitterState)) -> do
+            -- is the ref counter REALLY necessary?
+            putMVar vConnTable (Map.update connID (first (+ 1)) connTable)
+            send socket (encode Accept)
+            vPush <- newEmptyMVar
+            downstreamThread splitterState vPState vPush socket
+  where
+
+    upStreamThread (vPull, vState) splitterState vConnTable connID =
+      connectProxied destServ (upstream (vPull, vState) splitterState)
+      `finally` modifyMVar_ vConnTable (pure . Map.delete connID)
+
+    downstreamThread splitterState vPState vPush socket =
+      downstream (vPull, vState) vPush splitterState socket =
+
+    upstream (vPull, vState) splitterState socket =
+      splitterReceiver splitterState socket `concurrently_`
+      mergerSender socket vState vPull
+
+    downstream (vPull, vState) vPush splitterState socket =
+      splitterSender splitterState socket `concurrently_`
+      mergerReceiver socket vState vPull vPush
 
 serveTransporter :: (HostPreference, ServiceName)
                  -> [ProxiedHostService]
@@ -234,16 +315,16 @@ serveTransporter _ [] = error "serveTransporter: no destination given"
 serveTransporter (bindHost, bindPort) destServs =
   serve bindHost bindPort $ \ (bindSocket, _) -> do
     vConnID <- newMVar Nothing
-    vMessage <- newEmptyMVar
+    splitterState <- splitterStateNew
     vPState <- (,) <$> newEmptyMVar <*> newMVar mergerInitState
     svPushs <- for destServs $ \ x -> (,) x <$> newEmptyMVar
     concurrently_
-      (downstream vPState vMessage bindSocket)
-      (mapConcurrently_ (upstreamThread vConnID vMessage vPState) svPushs)
+      (downstream vPState splitterState bindSocket)
+      (mapConcurrently_ (upstreamThread vConnID splitterState vPState) svPushs)
   where
 
-    upstreamThread vConnID vMessage vPState (serv, vPush) =
-      connectProxied serv $ \ (socket, _) -> do
+    upstreamThread vConnID splitterState vPState (serv, vPush) =
+      connectProxied serv $ \ socket -> do
         send socket (encode protocolVer)
         reply <- modifyMVar vConnID $ \ mConnID ->
           case mConnID of
@@ -257,32 +338,16 @@ serveTransporter (bindHost, bindPort) destServs =
               reply <- recvThenDecodeX socket
               pure (mConnID, reply)
         case reply of
-          Accept  -> upstream vPState vPush vMessage socket
+          Accept  -> upstream vPState vPush splitterState socket
           Invalid -> pure () -- tear down connection
 
-    downstream (vPull, vState) vMessage socket =
-      splitterReceiver vMessage socket `concurrently_`
+    downstream (vPull, vState) splitterState socket =
+      splitterReceiver splitterState socket `concurrently_`
       mergerSender socket vState vPull
 
-    upstream (vPull, vState) vPush vMessage socket =
-      splitterSender vMessage socket `concurrently_`
+    upstream (vPull, vState) vPush splitterState socket =
+      splitterSender splitterState socket `concurrently_`
       mergerReceiver socket vState vPull vPush
-
-splitterSender :: MVar (Pos, ByteString) -> Socket -> IO ()
-splitterSender vMessage socket = do
-  bracketOnError
-    (takeMVar vMessage)
-    (putMVar vMessage)
-    (sendChunk socket)
-  splitterSender vMessage socket
-
-splitterReceiver :: MVar (Pos, ByteString) -> Socket -> IO ()
-splitterReceiver = splitterReceiverResume 0
-
-splitterReceiverResume :: Pos -> MVar (Pos, ByteString) -> Socket -> IO ()
-splitterReceiverResume pos vMessage socket = do
-  recvX socket maxChunkSize >>= putMVar vMessage . ((,) pos)
-  splitterReceiverResume (pos + 1) vMessage socket
 
 -- | Same as 'Int' except negative values are not allowed.
 --   It is serialized in the same way as 'Word64'.
@@ -329,9 +394,9 @@ generateConnectionID m
   | otherwise = generate
   where generate = do
           connID <- sizedSerializeGet connectionID getEntropy
-          case Map.lookup connID m of
-            Just _  -> generate
-            Nothing -> pure connID
+          if Map.elem connID m
+            then generate
+            else pure connID
 
 data Header
   = HeaderV1
@@ -431,6 +496,12 @@ generateSerializeEnumMap t = (getSize (B.length . snd <$> t), m, m')
                                "serialized values must have equal length")
           where s' = getSize rest
 
-connectProxied :: ProxiedHostService -> ((Socket, SockAddr) -> IO a) -> IO a
-connectProxied (Nothing, (host, port)) f = connect host port f
---connectProxied (Just (socksHost, socksPort), (host, port)) f = _
+connectProxied :: ProxiedHostService -> (Socket -> IO a) -> IO a
+connectProxied (Nothing, (host, port)) action =
+  connect host (show port) (action . fst)
+connectProxied (Just (socksHost, socksPort), (host, port)) action =
+  bracket
+    (socksConnectWith socksConf host (PortNumber (fromIntegral port)))
+    closeSock
+    action
+  where socksConf = defaultSocksConf socksHost (fromIntegral socksPort)

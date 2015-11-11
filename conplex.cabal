@@ -33,7 +33,9 @@ executable conplex
                      , entropy
                      , int-cast
                      , mtl
+                     , network
                      , network-simple
+                     , socks
                      , transformers
   default-language:    Haskell2010
                        -- temporary flags
