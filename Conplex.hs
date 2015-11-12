@@ -254,12 +254,12 @@ type ProxiedHostService = (Maybe HostService, HostService)
 
 -- type ConnTable = Map ConnectionID (Int {-refcount-})
 
-serveReceptor :: (HostPreference, ServiceName)
-              -> HostService
+serveReceptor :: (HostPreference, Int)
+              -> ProxiedHostService
               -> IO ()
 serveReceptor (bindHost, bindPort) destServ = do
   vConnTable <- newMVar (Map.empty)
-  serve bindHost bindPort $ \ (socket, _) -> do
+  serve bindHost (show bindPort) $ \ (socket, _) -> do
     header <- recvThenDecodeX socket
     case header of
       HeaderV1 -> pure ()
@@ -274,7 +274,7 @@ serveReceptor (bindHost, bindPort) destServ = do
                   `onException` putMVar vConnTable connTable
         let connTable' = Map.insert connID connInfo connTable
         forkIO_ (upstreamThread vPState splitterState vConnTable connID)
-        putMVar connTable'
+        putMVar vConnTable connTable'
         send socket (encode connID)
         vPush <- newEmptyMVar
         downstreamThread splitterState vPState vPush socket
@@ -282,23 +282,23 @@ serveReceptor (bindHost, bindPort) destServ = do
         connID <- recvThenDecodeX socket
         connTable <- takeMVar vConnTable
         case Map.lookup connID connTable of
-          Nothing ->
+          Nothing -> do
             putMVar vConnTable connTable
             send socket (encode Invalid)
           Just (_, (vPState, splitterState)) -> do
             -- is the ref counter REALLY necessary?
-            putMVar vConnTable (Map.update connID (first (+ 1)) connTable)
+            putMVar vConnTable (Map.adjust (first (+ 1)) connID connTable)
             send socket (encode Accept)
             vPush <- newEmptyMVar
             downstreamThread splitterState vPState vPush socket
   where
 
-    upStreamThread (vPull, vState) splitterState vConnTable connID =
+    upstreamThread (vPull, vState) splitterState vConnTable connID =
       connectProxied destServ (upstream (vPull, vState) splitterState)
       `finally` modifyMVar_ vConnTable (pure . Map.delete connID)
 
     downstreamThread splitterState vPState vPush socket =
-      downstream (vPull, vState) vPush splitterState socket =
+      downstream vPState vPush splitterState socket
 
     upstream (vPull, vState) splitterState socket =
       splitterReceiver splitterState socket `concurrently_`
@@ -308,13 +308,13 @@ serveReceptor (bindHost, bindPort) destServ = do
       splitterSender splitterState socket `concurrently_`
       mergerReceiver socket vState vPull vPush
 
-serveTransporter :: (HostPreference, ServiceName)
+serveTransporter :: (HostPreference, Int)
                  -> [ProxiedHostService]
                  -> IO ()
 serveTransporter _ [] = error "serveTransporter: no destination given"
 serveTransporter (bindHost, bindPort) destServs =
-  serve bindHost bindPort $ \ (bindSocket, _) -> do
-    vConnID <- newMVar Nothing
+  serve bindHost (show bindPort) $ \ (bindSocket, _) -> do
+    vConnID <- newMVar (Nothing :: Maybe ConnectionID)
     splitterState <- splitterStateNew
     vPState <- (,) <$> newEmptyMVar <*> newMVar mergerInitState
     svPushs <- for destServs $ \ x -> (,) x <$> newEmptyMVar
@@ -322,7 +322,7 @@ serveTransporter (bindHost, bindPort) destServs =
       (downstream vPState splitterState bindSocket)
       (mapConcurrently_ (upstreamThread vConnID splitterState vPState) svPushs)
   where
-
+  
     upstreamThread vConnID splitterState vPState (serv, vPush) =
       connectProxied serv $ \ socket -> do
         send socket (encode protocolVer)
@@ -394,7 +394,7 @@ generateConnectionID m
   | otherwise = generate
   where generate = do
           connID <- sizedSerializeGet connectionID getEntropy
-          if Map.elem connID m
+          if Map.member connID m
             then generate
             else pure connID
 
