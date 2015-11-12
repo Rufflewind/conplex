@@ -60,14 +60,12 @@ maxConnections = 8 * 1024
 chunkOverhead :: Int
 chunkOverhead = 1024
 
-portForward :: HostPreference
-            -> ServiceName
-            -> HostName
-            -> ServiceName
+portForward :: (HostPreference, Int)
+            -> (HostName, Int)
             -> IO ()
-portForward bindHost bindPort destHost destPort =
-  serve   bindHost bindPort $ \ (s,  _) ->
-  connect destHost destPort $ \ (s', _) ->
+portForward (bindHost, bindPort) (destHost, destPort) =
+  serve   bindHost (show bindPort) $ \ (s,  _) ->
+  connect destHost (show destPort) $ \ (s', _) ->
     forward s s'
     `concurrently_`
     forward s' s
@@ -89,10 +87,10 @@ data ConnectionClosedException =
 instance Exception ConnectionClosedException
 
 -- | Occurs if 'generateConnectionID' fails.
-data TooManyConnectionsException =
-  TooManyConnectionsException
+data ResourceExhaustedException =
+  ResourceExhaustedException String
   deriving (Show, Typeable)
-instance Exception TooManyConnectionsException
+instance Exception ResourceExhaustedException
 
 -- | Occurs if 'decode' fails.
 data DecodeException =
@@ -124,7 +122,7 @@ recvExactT :: Socket -> Int -> MaybeT IO ByteString
 recvExactT socket len = BL.toStrict <$> recvExactLT socket len
 
 recvExactLT :: Socket -> Int -> MaybeT IO BL.ByteString
-recvExactLT socket 0   = pure mempty
+recvExactLT _      0   = pure mempty
 recvExactLT socket len = do
   b <- MaybeT (recv socket len)
   (BL.fromStrict b <>) <$> recvExactLT socket (len - B.length b)
@@ -150,6 +148,10 @@ recvChunkX :: Socket -> IO (Pos, ByteString)
 recvChunkX socket = do
   pos  <- recvThenDecodeX socket
   size <- recvThenDecodeX socket
+  when (unSize size > maxChunkSize) $
+    throwIO (ResourceExhaustedException
+             ("recvChunkX: chunk size too large (" <>
+              show (unSize size) <> ")"))
   msg  <- recvExactX socket (unSize size)
   pure (pos, msg)
 
@@ -216,7 +218,8 @@ mergerSenderResume :: Pos
 mergerSenderResume pos socket state vPull = do
   msg <- mergerPull state vPull pos
   send socket msg
-  mergerSenderResume (pos + fromIntegral (B.length msg)) socket state vPull
+  -- OLD: pos + fromIntegral (B.length msg)
+  mergerSenderResume (pos + 1) socket state vPull
 
 type SplitterState = MVar (Maybe (Pos, ByteString))
 
@@ -275,7 +278,7 @@ serveReceptor (bindHost, bindPort) destServ = do
         let connTable' = Map.insert connID connInfo connTable
         forkIO_ (upstreamThread vPState splitterState vConnTable connID)
         putMVar vConnTable connTable'
-        send socket (encode connID)
+        sendMany socket [encode Welcome, encode connID]
         vPush <- newEmptyMVar
         downstreamThread splitterState vPState vPush socket
       Join -> do
@@ -287,7 +290,7 @@ serveReceptor (bindHost, bindPort) destServ = do
             send socket (encode Invalid)
           Just (_, (vPState, splitterState)) -> do
             -- is the ref counter REALLY necessary?
-            putMVar vConnTable (Map.adjust (first (+ 1)) connID connTable)
+            putMVar vConnTable (Map.adjust (first (+ (1 :: Int))) connID connTable)
             send socket (encode Accept)
             vPush <- newEmptyMVar
             downstreamThread splitterState vPState vPush socket
@@ -322,7 +325,7 @@ serveTransporter (bindHost, bindPort) destServs =
       (downstream vPState splitterState bindSocket)
       (mapConcurrently_ (upstreamThread vConnID splitterState vPState) svPushs)
   where
-  
+
     upstreamThread vConnID splitterState vPState (serv, vPush) =
       connectProxied serv $ \ socket -> do
         send socket (encode protocolVer)
@@ -390,7 +393,9 @@ connectionID b
 
 generateConnectionID :: Map ConnectionID a -> IO ConnectionID
 generateConnectionID m
-  | Map.size m > maxConnections = throwIO TooManyConnectionsException
+  | Map.size m > maxConnections =
+      throwIO (ResourceExhaustedException
+              "generateConnectionID: too many ongoing connections")
   | otherwise = generate
   where generate = do
           connID <- sizedSerializeGet connectionID getEntropy
@@ -406,7 +411,7 @@ DERIVE_FROM_SERIALIZE_ENUM(Header)
 
 instance SerializeEnum Header where
   serializeEnumInfo = generateSerializeEnumMap
-    [ (HeaderV1, "imux001")
+    [ (HeaderV1, "imux001\n")
     ]
 
 protocolVer :: Header
@@ -490,6 +495,7 @@ generateSerializeEnumMap :: Ord a => [(a, ByteString)] -> SerializeEnumInfo a
 generateSerializeEnumMap t = (getSize (B.length . snd <$> t), m, m')
   where (m, m') = generateBidiMap t
         getSize [] = 0
+        getSize (s : []) = s
         getSize (s : rest)
           | s == s'   = s
           | otherwise = error ("generateSerializeEnumMap: " <>
@@ -498,6 +504,7 @@ generateSerializeEnumMap t = (getSize (B.length . snd <$> t), m, m')
 
 connectProxied :: ProxiedHostService -> (Socket -> IO a) -> IO a
 connectProxied (Nothing, (host, port)) action =
+--  traceIO "connect" (host, port) $
   connect host (show port) (action . fst)
 connectProxied (Just (socksHost, socksPort), (host, port)) action =
   bracket

@@ -38,9 +38,9 @@ main = withSocketsDo $ do
 
   forkIO_ (serveTransporter (bindHost, bindPort)
                             ((,) proxy . (,) destHost <$> destPorts))
-  -- forkIO (portForward (Host "127.0.0.1", show 9001) ("127.0.0.1", "9002"))
-  for_ ((,) (Host destHost) <$> destPorts) $ \ (bindHost, bindPort) ->
-    (serveReceptor (bindHost, bindPort) (Nothing, ("127.0.0.1", 8080)))
+  forkIO_ (portForward (bindHost, 12001) ("127.0.0.1", 12000))
+--  for_ ((,) (Host destHost) <$> destPorts) $ \ (bindHost, bindPort) ->
+  forkIO_ (serveReceptor (bindHost, 12000) (Nothing, ("127.0.0.1", 8080)))
 
   standby
   where

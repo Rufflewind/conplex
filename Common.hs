@@ -29,6 +29,22 @@ import System.IO
 import qualified Data.Map.Strict as Map
 import qualified Data.Sequence as Seq
 
+traceIO :: Show b => String -> b -> IO a -> IO a
+traceIO name ctx action = do
+  hPutStrLn stderr ("++" <> name <> " " <> show ctx)
+  hFlush stderr
+  result <- try action
+  case result of
+    Left e  -> do
+      hPutStrLn stderr ("!!" <> name <> " " <> show ctx <>
+                        ": " <> show (e :: SomeException))
+      hFlush stderr
+      throwIO e
+    Right x -> do
+      hPutStrLn stderr ("--" <> name <> " " <> show ctx)
+      hFlush stderr
+      pure x
+
 modifyMVarPure :: MVar a -> (a -> a) -> IO ()
 modifyMVarPure v f = modifyMVar_ v (pure . f)
 
