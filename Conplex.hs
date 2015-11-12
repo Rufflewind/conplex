@@ -29,6 +29,7 @@ import Data.Typeable (Typeable, typeRep)
 import Data.Word (Word64, Word32)
 import Foreign (Storable, sizeOf)
 import Network (PortID(PortNumber))
+import Network.Socket (ShutdownCmd(ShutdownSend), shutdown)
 import Network.Simple.TCP
 import Network.Socks5 (defaultSocksConf, socksConnectWith)
 import System.IO
@@ -59,6 +60,10 @@ maxConnections = 8 * 1024
 
 chunkOverhead :: Int
 chunkOverhead = 1024
+
+-- | Signal the end of the stream by closing the writing half of the socket.
+sendEOF :: Socket -> IO ()
+sendEOF socket = shutdown socket ShutdownSend
 
 portForward :: (HostPreference, Int)
             -> (HostName, Int)
@@ -145,7 +150,7 @@ recvThenDecodeX socket =
 
 -- | Can throw 'ConnectionClosedException' or 'DecodeException'.
 recvChunkX :: Socket -> IO (Pos, ByteString)
-recvChunkX socket = do
+recvChunkX socket = traceIO "recvChunkX" ()$ do
   pos  <- recvThenDecodeX socket
   size <- recvThenDecodeX socket
   when (unSize size > maxChunkSize) $
@@ -159,6 +164,8 @@ type Pos = Word64
 
 type MergerState = (Map Pos (MVar ByteString), Maybe Pos)
 
+type PullVar = MVar (Maybe ByteString)
+
 mergerInitState :: MergerState
 mergerInitState = (Map.empty, Nothing)
 
@@ -171,18 +178,18 @@ mergerInsert :: MVar MergerState -> MVar ByteString -> Pos -> IO ()
 mergerInsert state vPush pos = do
   modifyMVar_ state (pure . first (Map.insert pos vPush))
 
-mergerTransfer :: MVar MergerState -> MVar ByteString -> IO ()
+mergerTransfer :: MVar MergerState -> PullVar -> IO ()
 mergerTransfer state vPull =
   modifyMVar_ state $ \ (table, maybePos) ->
     pure (table, maybePos) `fromMaybe` do
       pos <- maybePos
       (vPush, table') <- popMap pos table
       Just $ do
-        takeMVar vPush >>= putMVar vPull
+        takeMVar vPush >>= putMVar vPull . Just
         pure (table', Nothing)
 
 mergerPush :: MVar MergerState
-           -> MVar ByteString
+           -> PullVar
            -> MVar ByteString
            -> (Pos, ByteString)
            -> IO ()
@@ -191,7 +198,7 @@ mergerPush state vPull vPush (pos, msg) = do
   mergerInsert state vPush pos
   mergerTransfer state vPull
 
-mergerPull :: MVar MergerState -> MVar ByteString -> Pos -> IO ByteString
+mergerPull :: MVar MergerState -> PullVar -> Pos -> IO (Maybe ByteString)
 mergerPull state vPull pos = do
   mergerSetPos state pos
   forkIO_ (mergerTransfer state vPull)
@@ -199,27 +206,33 @@ mergerPull state vPull pos = do
 
 mergerReceiver :: Socket
                -> MVar MergerState
+               -> PullVar
                -> MVar ByteString
-               -> MVar ByteString
-               -> IO a
+               -> IO ()
 mergerReceiver socket state vPull vPush = do
-  (pos, msg) <- recvChunkX socket
-  mergerPush state vPull vPush (pos, msg)
-  mergerReceiver socket state vPull vPush
+  result <- try (recvChunkX socket)
+  case result of
+    Left e -> let _ = e :: SomeException in print e
+    Right (pos, msg) -> do
+      mergerPush state vPull vPush (pos, msg)
+      mergerReceiver socket state vPull vPush
 
-mergerSender :: Socket -> MVar MergerState -> MVar ByteString -> IO a
+mergerSender :: Socket -> MVar MergerState -> PullVar -> IO ()
 mergerSender = mergerSenderResume 0
 
 mergerSenderResume :: Pos
                    -> Socket
                    -> MVar MergerState
-                   -> MVar ByteString
-                   -> IO a
+                   -> PullVar
+                   -> IO ()
 mergerSenderResume pos socket state vPull = do
-  msg <- mergerPull state vPull pos
-  send socket msg
-  -- OLD: pos + fromIntegral (B.length msg)
-  mergerSenderResume (pos + 1) socket state vPull
+  mMsg <- mergerPull state vPull pos
+  case mMsg of
+    Nothing  -> pure ()
+    Just msg -> do
+      send socket msg
+      -- OLD: pos + fromIntegral (B.length msg)
+      mergerSenderResume (pos + 1) socket state vPull
 
 type SplitterState = MVar (Maybe (Pos, ByteString))
 
@@ -237,6 +250,7 @@ splitterSender vMessage socket =
         pure (splitterSender vMessage socket)
       Nothing  -> do
         putMVar vMessage mMsg
+        sendEOF socket
         pure (pure ())
 
 splitterReceiver :: SplitterState -> Socket -> IO ()
@@ -260,7 +274,7 @@ type ProxiedHostService = (Maybe HostService, HostService)
 serveReceptor :: (HostPreference, Int)
               -> ProxiedHostService
               -> IO ()
-serveReceptor (bindHost, bindPort) destServ = do
+serveReceptor (bindHost, bindPort) destServ = traceIO "serveReceptor" (bindHost, bindPort, destServ) $ do
   vConnTable <- newMVar (Map.empty)
   serve bindHost (show bindPort) $ \ (socket, _) -> do
     header <- recvThenDecodeX socket
@@ -281,6 +295,7 @@ serveReceptor (bindHost, bindPort) destServ = do
         sendMany socket [encode Welcome, encode connID]
         vPush <- newEmptyMVar
         downstreamThread splitterState vPState vPush socket
+          `finally` decref vConnTable connID
       Join -> do
         connID <- recvThenDecodeX socket
         connTable <- takeMVar vConnTable
@@ -289,12 +304,26 @@ serveReceptor (bindHost, bindPort) destServ = do
             putMVar vConnTable connTable
             send socket (encode Invalid)
           Just (_, (vPState, splitterState)) -> do
-            -- is the ref counter REALLY necessary?
+            -- Q. is the ref counter REALLY necessary?
+            -- A. yes it is: we need it to gracefully terminate the mergerSender
             putMVar vConnTable (Map.adjust (first (+ (1 :: Int))) connID connTable)
             send socket (encode Accept)
             vPush <- newEmptyMVar
             downstreamThread splitterState vPState vPush socket
+              `finally` decref vConnTable connID
   where
+
+    decref vConnTable connID =
+      mask_ . modifyMVar_ vConnTable $ \ connTable ->
+        case Map.lookup connID connTable of
+          Nothing -> pure connTable
+          Just (count, info)
+            | count > 1 -> pure (Map.adjust (first pred) connID connTable)
+            | otherwise -> do
+                finalizer info
+                pure (Map.delete connID connTable)
+
+    finalizer ((vPull, _), _) = putMVar vPull Nothing
 
     upstreamThread (vPull, vState) splitterState vConnTable connID =
       connectProxied destServ (upstream (vPull, vState) splitterState)
