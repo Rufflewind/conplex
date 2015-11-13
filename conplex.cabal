@@ -35,6 +35,8 @@ executable conplex
                      , mtl
                      , network
                      , network-simple
+                     , optparse-applicative
+                     , parsec
                      , socks
                      , transformers
   default-language:    Haskell2010

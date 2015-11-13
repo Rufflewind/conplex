@@ -28,16 +28,17 @@ import Data.Tuple (swap)
 import Data.Typeable (Typeable, typeRep)
 import Data.Word (Word64, Word32)
 import Foreign (Storable, sizeOf)
-import Network (PortID(PortNumber))
-import Network.Socket (ShutdownCmd(ShutdownSend), shutdown)
 import Network.Simple.TCP
-import Network.Socks5 (defaultSocksConf, socksConnectWith)
+import Network.Socks5 (defaultSocksConfFromSockAddr, socksConnectWith)
 import System.IO
+import System.IO.Error
 import System.Entropy (getEntropy)
 import qualified Data.ByteString.Char8 as B
 import qualified Data.ByteString.Lazy.Char8 as BL
 import qualified Data.Map.Strict as Map
 import qualified Data.Sequence as Seq
+import qualified Network as Net
+import qualified Network.Socket as Net
 import Common
 
 #define DERIVE_FROM_SERIALIZE_ENUM(Type) \
@@ -63,24 +64,25 @@ chunkOverhead = 1024
 
 -- | Signal the end of the stream by closing the writing half of the socket.
 sendEOF :: Socket -> IO ()
-sendEOF socket = shutdown socket ShutdownSend
+sendEOF socket = Net.shutdown socket Net.ShutdownSend
 
-portForward :: (HostPreference, Int)
-            -> (HostName, Int)
+portForward :: (HostPreference, ServiceName)
+            -> ProxiedHostService
             -> IO ()
-portForward (bindHost, bindPort) (destHost, destPort) =
-  serve   bindHost (show bindPort) $ \ (s,  _) ->
-  connect destHost (show destPort) $ \ (s', _) ->
-    forward s s'
+portForward (bindHost, bindPort) destServ =
+  serve bindHost bindPort $ \ (bindSocket,  _) ->
+  connectProxied destServ $ \ (destSocket, _) ->
+    forward bindSocket destSocket
     `concurrently_`
-    forward s' s
-  where forward s s' = do
-          mx <- recv s maxChunkSize
-          case mx of
-            Nothing -> pure ()
-            Just x  -> do
-              send s' x
-              forward s s'
+    forward destSocket bindSocket
+  where forward srcSocket tarSocket = do
+          maybeMsg <- recv srcSocket maxChunkSize
+          case maybeMsg of
+            Nothing -> do
+              sendEOF tarSocket
+            Just msg -> do
+              send tarSocket msg
+              forward srcSocket tarSocket
 
 keySize :: Int
 keySize = 8 -- bytes
@@ -150,14 +152,14 @@ recvThenDecodeX socket =
 
 -- | Can throw 'ConnectionClosedException' or 'DecodeException'.
 recvChunkX :: Socket -> IO (Pos, ByteString)
-recvChunkX socket = traceIO "recvChunkX" ()$ do
-  pos  <- recvThenDecodeX socket
+recvChunkX socket = do
+  pos <- recvThenDecodeX socket
   size <- recvThenDecodeX socket
   when (unSize size > maxChunkSize) $
     throwIO (ResourceExhaustedException
              ("recvChunkX: chunk size too large (" <>
               show (unSize size) <> ")"))
-  msg  <- recvExactX socket (unSize size)
+  msg <- recvExactX socket (unSize size)
   pure (pos, msg)
 
 type Pos = Word64
@@ -265,18 +267,16 @@ splitterReceiverResume pos vMessage socket = do
       putMVar vMessage (Just (pos, msg))
       splitterReceiverResume (pos + 1) vMessage socket
 
-type HostService = (HostName, Int)
+type HostService = (HostName, ServiceName)
 
 type ProxiedHostService = (Maybe HostService, HostService)
 
--- type ConnTable = Map ConnectionID (Int {-refcount-})
-
-serveReceptor :: (HostPreference, Int)
+serveReceptor :: (HostPreference, ServiceName)
               -> ProxiedHostService
               -> IO ()
-serveReceptor (bindHost, bindPort) destServ = traceIO "serveReceptor" (bindHost, bindPort, destServ) $ do
+serveReceptor (bindHost, bindPort) destServ = do
   vConnTable <- newMVar (Map.empty)
-  serve bindHost (show bindPort) $ \ (socket, _) -> do
+  serve bindHost bindPort $ \ (socket, _) -> do
     header <- recvThenDecodeX socket
     case header of
       HeaderV1 -> pure ()
@@ -326,7 +326,7 @@ serveReceptor (bindHost, bindPort) destServ = traceIO "serveReceptor" (bindHost,
     finalizer ((vPull, _), _) = putMVar vPull Nothing
 
     upstreamThread (vPull, vState) splitterState vConnTable connID =
-      connectProxied destServ (upstream (vPull, vState) splitterState)
+      connectProxied destServ (upstream (vPull, vState) splitterState . fst)
       `finally` modifyMVar_ vConnTable (pure . Map.delete connID)
 
     downstreamThread splitterState vPState vPush socket =
@@ -340,12 +340,12 @@ serveReceptor (bindHost, bindPort) destServ = traceIO "serveReceptor" (bindHost,
       splitterSender splitterState socket `concurrently_`
       mergerReceiver socket vState vPull vPush
 
-serveTransporter :: (HostPreference, Int)
+serveTransporter :: (HostPreference, ServiceName)
                  -> [ProxiedHostService]
                  -> IO ()
 serveTransporter _ [] = error "serveTransporter: no destination given"
 serveTransporter (bindHost, bindPort) destServs =
-  serve bindHost (show bindPort) $ \ (bindSocket, _) -> do
+  serve bindHost bindPort $ \ (bindSocket, _) -> do
     vConnID <- newMVar (Nothing :: Maybe ConnectionID)
     splitterState <- splitterStateNew
     vPState <- (,) <$> newEmptyMVar <*> newMVar mergerInitState
@@ -356,7 +356,7 @@ serveTransporter (bindHost, bindPort) destServs =
   where
 
     upstreamThread vConnID splitterState vPState (serv, vPush) =
-      connectProxied serv $ \ socket -> do
+      connectProxied serv $ \ (socket, _) -> do
         send socket (encode protocolVer)
         reply <- modifyMVar vConnID $ \ mConnID ->
           case mConnID of
@@ -531,13 +531,34 @@ generateSerializeEnumMap t = (getSize (B.length . snd <$> t), m, m')
                                "serialized values must have equal length")
           where s' = getSize rest
 
-connectProxied :: ProxiedHostService -> (Socket -> IO a) -> IO a
-connectProxied (Nothing, (host, port)) action =
---  traceIO "connect" (host, port) $
-  connect host (show port) (action . fst)
-connectProxied (Just (socksHost, socksPort), (host, port)) action =
-  bracket
-    (socksConnectWith socksConf host (PortNumber (fromIntegral port)))
-    closeSock
-    action
-  where socksConf = defaultSocksConf socksHost (fromIntegral socksPort)
+connectProxied :: ProxiedHostService -> ((Socket, SockAddr) -> IO a) -> IO a
+connectProxied (Nothing, (host, port)) action = connect host port action
+connectProxied (Just (socksHost, socksPort), (destHost, destPort)) action = do
+  socksAddr <- getAddr socksHost socksPort
+  destAddr  <- getAddr destHost  destPort
+  destPort' <- fromJustIO (invalidPortError destPort) (getPort destAddr)
+  let conf = defaultSocksConfFromSockAddr socksAddr
+      conn = socksConnectWith conf destHost (Net.PortNumber destPort')
+  bracket conn closeSock $ \ socket -> do
+    addr <- Net.getSocketName socket
+    action (socket, addr)
+  where
+
+    getAddr host port =
+      Net.addrAddress . head <$>
+        Net.getAddrInfo (Just hints) (Just host) (Just port)
+
+    getPort addr =
+      case addr of
+        Net.SockAddrInet  port _     -> Just port
+        Net.SockAddrInet6 port _ _ _ -> Just port
+        _                        -> Nothing
+
+    hints =
+      Net.defaultHints
+      { Net.addrFlags = [Net.AI_ADDRCONFIG]
+      , Net.addrSocketType = Net.Stream }
+
+    invalidPortError port =
+      (`ioeSetErrorString` ("invalid port: " <> show port)) $
+      mkIOError illegalOperationErrorType "connectProxied" Nothing Nothing
