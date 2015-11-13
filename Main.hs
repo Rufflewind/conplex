@@ -6,13 +6,9 @@ import Control.Concurrent.Async
 import Control.Concurrent.MVar
 import Control.Exception
 import Control.Monad
-import Control.Monad.Error.Class
-import Control.Monad.Trans.Maybe
-import Control.Monad.IO.Class
 import Data.ByteString.Char8 (ByteString)
 import Data.Foldable
 import Data.Function ((&))
-import Data.IntCast
 import Data.Int (Int64)
 import Data.Map.Strict (Map)
 import Data.Maybe (fromMaybe)
@@ -43,10 +39,9 @@ main = do
       when (flagVerbose flags) $
         print action
       case action of
-        -- Forward src dst -> portForward src dst
-        -- Transporter src dst -> serveTransporter src dst
-        -- Receptor src dsts -> serveReceptor src dsts
-        _ -> pure ()
+        Forward     src dst  -> serveForwarder   src dst
+        Transporter src dst  -> serveTransporter src dst
+        Receptor    src dsts -> serveReceptor    src dsts
 
 opts :: O.ParserInfo (Flags, [Action])
 opts =

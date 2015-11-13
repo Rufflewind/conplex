@@ -66,10 +66,10 @@ chunkOverhead = 1024
 sendEOF :: Socket -> IO ()
 sendEOF socket = Net.shutdown socket Net.ShutdownSend
 
-portForward :: (HostPreference, ServiceName)
-            -> ProxiedHostService
-            -> IO ()
-portForward (bindHost, bindPort) destServ =
+serveForwarder :: (HostPreference, ServiceName)
+               -> ProxiedHostService
+               -> IO ()
+serveForwarder (bindHost, bindPort) destServ =
   serve bindHost bindPort $ \ (bindSocket,  _) ->
   connectProxied destServ $ \ (destSocket, _) ->
     forward bindSocket destSocket
@@ -214,7 +214,7 @@ mergerReceiver :: Socket
 mergerReceiver socket state vPull vPush = do
   result <- try (recvChunkX socket)
   case result of
-    Left e -> let _ = e :: SomeException in print e
+    Left ConnectionClosedException -> pure ()
     Right (pos, msg) -> do
       mergerPush state vPull vPush (pos, msg)
       mergerReceiver socket state vPull vPush
@@ -552,7 +552,7 @@ connectProxied (Just (socksHost, socksPort), (destHost, destPort)) action = do
       case addr of
         Net.SockAddrInet  port _     -> Just port
         Net.SockAddrInet6 port _ _ _ -> Just port
-        _                        -> Nothing
+        _                            -> Nothing
 
     hints =
       Net.defaultHints
