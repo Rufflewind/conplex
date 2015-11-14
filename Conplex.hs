@@ -214,7 +214,7 @@ mergerReceiver :: Socket
 mergerReceiver socket state vPull vPush = do
   result <- try (recvChunkX socket)
   case result of
-    Left ConnectionClosedException -> pure ()
+    Left ConnectionClosedException -> print "mergerReceiver: BYE" >> pure ()
     Right (pos, msg) -> do
       mergerPush state vPull vPush (pos, msg)
       mergerReceiver socket state vPull vPush
@@ -230,7 +230,7 @@ mergerSenderResume :: Pos
 mergerSenderResume pos socket state vPull = do
   mMsg <- mergerPull state vPull pos
   case mMsg of
-    Nothing  -> pure ()
+    Nothing  -> print "mergerSender: BYE" >> pure ()
     Just msg -> do
       send socket msg
       -- OLD: pos + fromIntegral (B.length msg)
@@ -252,6 +252,7 @@ splitterSender vMessage socket =
         pure (splitterSender vMessage socket)
       Nothing  -> do
         putMVar vMessage mMsg
+        print "splitterSender: BYE"
         sendEOF socket
         pure (pure ())
 
@@ -262,7 +263,7 @@ splitterReceiverResume :: Pos -> SplitterState -> Socket -> IO ()
 splitterReceiverResume pos vMessage socket = do
   mMsg <- recv socket maxChunkSize
   case mMsg of
-    Nothing  -> putMVar vMessage Nothing
+    Nothing  -> print "splitterReceiver: BYE" >> putMVar vMessage Nothing
     Just msg -> do
       putMVar vMessage (Just (pos, msg))
       splitterReceiverResume (pos + 1) vMessage socket
@@ -375,6 +376,7 @@ serveTransporter (bindHost, bindPort) destServs =
 
     downstream (vPull, vState) splitterState socket =
       splitterReceiver splitterState socket `concurrently_`
+      -- mergerSender is immortal !
       mergerSender socket vState vPull
 
     upstream (vPull, vState) vPush splitterState socket =
